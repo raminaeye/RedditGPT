@@ -1,3 +1,13 @@
+"""Decoder-only GPT transformer trained on Reddit text, karpathy nanoGPT style.
+
+Model definition (``Head``, ``MultiHeadAttention``, ``FeedFoward``, ``Block``,
+``GPTLanguageModel``) plus tokenizer setup helpers.
+
+Note: importing this module loads the pickled config from the data directory
+and trains the byte-level BPE tokenizer on ``training_text.txt``, so those
+artifacts must exist before import.
+"""
+
 import pandas as pd
 from collections import Counter
 import sys
@@ -27,9 +37,9 @@ class GPTConfig:
     n_embd: int = 512
     dropout: float = 0.2
     batch_size: int = 32
-    temperature=1.0 
+    temperature=1.0
     top_k=20
-    
+
 config = dill.load(open(path_to_data + 'scratch_reddit_gpt_config.pickle','rb'))
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -66,7 +76,7 @@ tokenizer.save_model(path_to_data, "redditTok")
 
 
 class Head(nn.Module):
-    """ self-attention """
+    """Single self-attention head."""
 
     def __init__(self, head_size, rank=32, alpha=1):
         super().__init__()
@@ -86,27 +96,21 @@ class Head(nn.Module):
         q = self.query(x) # (B,T,hs)
         # compute attention scores ("affinities")
         wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)  # decoder only, forget the future 
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)  # decoder only, forget the future
         wei = F.softmax(wei, dim=-1) # (B, T, T)
         wei = self.dropout(wei) # (B, T, T)
-        
-        # add LoRA 
-#         rank = 8
-#         W_A = nn.Parameter(torch.empty(C, self.rank)) # LoRA weight A
-#         W_B = nn.Parameter(torch.empty(self.rank, T))
-        
+
         # perform the weighted aggregation of the values
         v = self.value(x) # (B,T,hs)
         out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
-#         out += (W_A @ W_B)*self.alpha
         return out
 
-## Multihead Attention 
+## Multihead Attention
 
-# Several self attention layers working in parallel. The result from each self attention layer are then concatenated and projected to the desired embedding dimension. 
+# Several self attention layers working in parallel. The result from each self attention layer are then concatenated and projected to the desired embedding dimension.
 
 class MultiHeadAttention(nn.Module):
-    """ multiple heads of self-attention in parallel """
+    """Multiple heads of self-attention in parallel."""
 
     def __init__(self, num_heads, head_size):
         super().__init__()
@@ -115,14 +119,14 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        # concatenated over the embedding dimension (B, T , hs * num_heads) 
-        out = torch.cat([h(x) for h in self.heads], dim=-1) 
+        # concatenated over the embedding dimension (B, T , hs * num_heads)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
 
-    
+
 class FeedFoward(nn.Module):
-    """ a simple linear layer followed by a non-linearity """
+    """A simple linear layer followed by a non-linearity."""
 
     def __init__(self, n_embd):
         super().__init__()
@@ -135,33 +139,39 @@ class FeedFoward(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-    
+
 class Block(nn.Module):
-    """ Transformer block: communication followed by computation """
+    """Transformer block: communication followed by computation."""
 
     def __init__(self, n_embd, n_head):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
-        head_size = n_embd // n_head # head size is determined by how many heads and how long the embedding we want 
-        self.sa = MultiHeadAttention(n_head, head_size) # this many attention layer with head size output 
+        head_size = n_embd // n_head # head size is determined by how many heads and how long the embedding we want
+        self.sa = MultiHeadAttention(n_head, head_size) # this many attention layers with head size output
         self.ffwd = FeedFoward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd) # layer norm (normalizing features not examples)
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x)) 
+        x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x)) # residual layer
         return x
-    
+
 class GPTLanguageModel(nn.Module):
+    """Decoder-only GPT language model.
+
+    Token and position embeddings feed a stack of transformer ``Block``s,
+    followed by a final layer norm and a linear head over the vocabulary.
+    Padding positions are excluded from the training loss.
+    """
 
     def __init__(self,config):
-        
+
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        
+
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table    = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=pad_token_id)
         self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
@@ -180,6 +190,16 @@ class GPTLanguageModel(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
+        """Run a forward pass; optionally compute the masked cross-entropy loss.
+
+        Args:
+            idx: (B, T) tensor of token indices.
+            targets: Optional (B, T) tensor of next-token targets.
+
+        Returns:
+            Tuple ``(logits, loss)`` where logits has shape
+            (B, T, vocab_size) and loss is None when targets are not given.
+        """
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
@@ -196,15 +216,30 @@ class GPTLanguageModel(nn.Module):
             B, T, C = logits.shape
             logits  = logits.view(B*T, C)
             targets = targets.view(B*T)
-            mask = (targets != torch.tensor(pad_token_id)) # padding mask
+            mask = (targets != pad_token_id) # padding mask
             loss = F.cross_entropy(logits, targets, reduction='none')
             loss *= mask
             loss  = loss.mean()
-            
+
         return logits, loss
-        
-    
+
+
     def generate(self, idx, max_new_tokens,  temperature=0.5, top_k=None, skip_special_tokens=True):
+        """Autoregressively generate tokens from a starting context.
+
+        Samples ``max_new_tokens`` tokens one at a time, stopping early if the
+        end-of-sequence token is produced.
+
+        Args:
+            idx: (B, T) tensor of starting token indices.
+            max_new_tokens: Maximum number of tokens to generate.
+            temperature: Softmax temperature; lower values make output sharper.
+            top_k: If set, sample only from the top-k most likely tokens.
+            skip_special_tokens: Kept for API compatibility (unused).
+
+        Returns:
+            (B, T + n_generated) tensor of token indices.
+        """
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
@@ -219,11 +254,10 @@ class GPTLanguageModel(nn.Module):
                 logits[logits < v[:, [-1]]] = -float('Inf')
             probs  = F.softmax(logits, dim=-1) # (B, C)
             # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)            
+            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
             # append sampled index to the running sequence
-            if idx_next[0][0].detach().numpy() == end_token_id:
+            if idx_next[0][0].item() == end_token_id:
                 break
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-            
-        return idx
 
+        return idx
